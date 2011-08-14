@@ -57,7 +57,7 @@ static char iface[PROPERTY_VALUE_MAX];
 #define WIFI_DRIVER_MODULE_PATH         "/system/lib/modules/libra.ko"
 #endif
 #ifndef WIFI_DRIVER_MODULE_NAME
-#define WIFI_DRIVER_MODULE_NAME         "libra.ko"
+#define WIFI_DRIVER_MODULE_NAME         "libra"
 #endif
 #ifndef WIFI_SDIO_IF_DRIVER_MODULE_PATH
 #define WIFI_SDIO_IF_DRIVER_MODULE_PATH         "/system/lib/modules/librasdioif.ko"
