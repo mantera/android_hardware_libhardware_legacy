@@ -1,5 +1,6 @@
 /*
  * Copyright 2008, The Android Open Source Project
+ * Copyright (c) 2009-2011, Code Aurora Forum. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,7 +44,6 @@ static struct wpa_ctrl *monitor_conn;
 extern int do_dhcp();
 extern int ifc_init();
 extern void ifc_close();
-extern int ifc_up(const char *name);
 extern char *dhcp_lasterror();
 extern void get_dhcp_info();
 extern int init_module(void *, unsigned long, const char *);
@@ -54,21 +54,22 @@ static char iface[PROPERTY_VALUE_MAX];
 // sockets is in
 
 #ifndef WIFI_DRIVER_MODULE_PATH
-#define WIFI_DRIVER_MODULE_PATH         "/system/lib/modules/libra.ko"
+#define WIFI_DRIVER_MODULE_PATH         "/system/lib/modules/wlan.ko"
 #endif
 #ifndef WIFI_DRIVER_MODULE_NAME
-#define WIFI_DRIVER_MODULE_NAME         "libra"
+#define WIFI_DRIVER_MODULE_NAME         "wlan"
 #endif
 #ifndef WIFI_SDIO_IF_DRIVER_MODULE_PATH
-#define WIFI_SDIO_IF_DRIVER_MODULE_PATH         "/system/lib/modules/librasdioif.ko"
+#define WIFI_SDIO_IF_DRIVER_MODULE_PATH         ""
 #endif
 #ifndef WIFI_SDIO_IF_DRIVER_MODULE_NAME
-#define WIFI_SDIO_IF_DRIVER_MODULE_NAME "librasdioif"
+#define WIFI_SDIO_IF_DRIVER_MODULE_NAME ""
 #endif
 #ifndef WIFI_DRIVER_MODULE_ARG
 #define WIFI_SDIO_IF_DRIVER_MODULE_ARG  ""
 #define WIFI_DRIVER_MODULE_ARG          ""
 #endif
+
 #ifndef WIFI_FIRMWARE_LOADER
 #define WIFI_FIRMWARE_LOADER		""
 #endif
@@ -81,8 +82,9 @@ static const char DRIVER_MODULE_NAME[]  = WIFI_DRIVER_MODULE_NAME;
 static const char DRIVER_SDIO_IF_MODULE_NAME[]  = WIFI_SDIO_IF_DRIVER_MODULE_NAME;
 static const char DRIVER_MODULE_TAG[]   = WIFI_DRIVER_MODULE_NAME " ";
 static const char DRIVER_MODULE_PATH[]  = WIFI_DRIVER_MODULE_PATH;
-static const char DRIVER_MODULE_ARG[]   = WIFI_DRIVER_MODULE_ARG;
 static const char DRIVER_SDIO_IF_MODULE_PATH[]  = WIFI_SDIO_IF_DRIVER_MODULE_PATH;
+static const char DRIVER_MODULE_ARG[]   = WIFI_DRIVER_MODULE_ARG;
+static const char DRIVER_SDIO_IF_MODULE_ARG[]   = WIFI_SDIO_IF_DRIVER_MODULE_ARG;
 static const char FIRMWARE_LOADER[]     = WIFI_FIRMWARE_LOADER;
 static const char DRIVER_PROP_NAME[]    = "wlan.driver.status";
 static const char SUPPLICANT_NAME[]     = "wpa_supplicant";
@@ -90,15 +92,16 @@ static const char SUPP_PROP_NAME[]      = "init.svc.wpa_supplicant";
 static const char SUPP_CONFIG_TEMPLATE[]= "/system/etc/wifi/wpa_supplicant.conf";
 static const char SUPP_CONFIG_FILE[]    = "/data/misc/wifi/wpa_supplicant.conf";
 static const char MODULE_FILE[]         = "/proc/modules";
-
+static const char SDIO_POLLING_ON[]     = "/etc/init.qcom.sdio.sh 1";
+static const char SDIO_POLLING_OFF[]    = "/etc/init.qcom.sdio.sh 0";
+static const char LOCK_FILE[]           = "/data/misc/wifi/drvr_ld_lck_pid";
 static const char AP_DRIVER_MODULE_NAME[]  = "tiap_drv";
 static const char AP_DRIVER_MODULE_TAG[]   = "tiap_drv" " ";
 static const char AP_DRIVER_MODULE_PATH[]  = "/system/lib/modules/tiap_drv.ko";
 static const char AP_DRIVER_MODULE_ARG[]   = "";
 static const char AP_FIRMWARE_LOADER[]     = "wlan_ap_loader";
 static const char AP_DRIVER_PROP_NAME[]    = "wlan.ap.driver.status";
-static const char SDIO_POLLING_ON[]     = "/etc/init.qcom.sdio.sh 1";
-static const char SDIO_POLLING_OFF[]    = "/etc/init.qcom.sdio.sh 0";
+static int _wifi_unload_driver();   /* Does not check Bluetooth status */
 
 #ifdef WIFI_EXT_MODULE_NAME
 static const char EXT_MODULE_NAME[] = WIFI_EXT_MODULE_NAME;
@@ -111,113 +114,129 @@ static const char EXT_MODULE_ARG[] = "";
 #ifdef WIFI_EXT_MODULE_PATH
 static const char EXT_MODULE_PATH[] = WIFI_EXT_MODULE_PATH;
 #endif
+#define MAX_LOCK_TRY    14
+#define LOCK_TRY_LAST_CHANCE    2
 
-/* rfkill support borrowed from bluetooth */
-static int rfkill_id = -1;
-static char *rfkill_state_path = NULL;
-
-
-static int init_rfkill() {
-    char path[64];
-    char buf[16];
+static int lock(void)
+{
     int fd;
-    int sz;
-    int id;
-    for (id = 0; ; id++) {
-        snprintf(path, sizeof(path), "/sys/class/rfkill/rfkill%d/type", id);
-        fd = open(path, O_RDONLY);
-        if (fd < 0) {
-            LOGW("open(%s) failed: %s (%d)\n", path, strerror(errno), errno);
-            return -1;
+    int i = MAX_LOCK_TRY;
+    char pid_buf[12];   /* 32-bit decimal pid, \n, \0 */
+    int sleep_time;
+    int first_pid = -1;
+
+    while (((fd = open(LOCK_FILE, O_EXCL | O_CREAT | O_RDWR, 0660)) < 0)
+            && (i > 0)) {
+
+        LOGV("lock file excl open error: %s; cnt: %d", strerror(errno), i);
+        sleep_time = 500000;    /* Time till try again (usec) */
+        if (errno != EEXIST) {
+            LOGE("Can't create lock file: %s", strerror(errno));
+            break;
+        } else {
+            /* After first try, check if the owner exists; delete file if not.
+             * If owner does exist, check on last try if owner is still the same
+             * and delete file if so (due to stale file or owner is stuck).
+             * Else, give the new owner a chance.
+             */
+            if ((i == MAX_LOCK_TRY) || i == LOCK_TRY_LAST_CHANCE) {
+                fd = open(LOCK_FILE, O_RDONLY, 0);
+                if (fd < 0) {
+                    if (errno == ENOENT) {
+                        LOGV("Lock file is gone now");
+                        sleep_time = 0;
+                    } else {
+                        LOGW("Can't open lock file: %s", strerror(errno));
+                    }
+                } else {
+                    int pid_len;
+
+                    pid_len = read(fd, pid_buf, sizeof(pid_buf));
+                    close(fd);
+                    fd = -1;
+                    if (pid_len > 0) {
+                        int pid;
+                        char* end;
+
+                        /* Accepted format is <whitespaces><digits>\n */
+                        pid = (int) strtol(pid_buf, &end, 10);
+
+                        if ((end == NULL) || (end <= pid_buf) || (*end != '\n')) {
+                            LOGV("strtol error: Can't parse owner pid");
+                            pid = 0;
+                        }
+                        if ((pid == getpid()) || /* Owner should not be me */
+                                ((pid <= 0)) || /* Invalid pid */
+                                ((pid > 0) && (kill((pid_t)pid, 0) < 0) &&
+                                 (errno == ESRCH))) {
+                            LOGV("Deleting old lock file, was owned by %d", pid);
+                            if (unlink(LOCK_FILE) < 0) {
+                                LOGE("Can't delete old lock file, was owned by %d: %s",
+                                     pid, strerror(errno));
+                            }
+                            sleep_time = 0;
+                        } else {
+                            LOGV("Lock file %s owned by %d",
+                                    (first_pid == pid) ? "still" : "is", pid);
+                            if (first_pid != pid) {
+                                /* Wait a fresh set of tries and save the current owner */
+                                i = MAX_LOCK_TRY;
+                                first_pid = pid;
+                            }
+                            if (i == LOCK_TRY_LAST_CHANCE) {
+                                LOGV("Deleting lock file; owner stuck or file stale");
+                                if (unlink(LOCK_FILE) < 0) {
+                                    LOGE("Can't delete old lock file: %s", strerror(errno));
+                                }
+                                sleep_time = 0;
+                            }
+                        }
+                    } else {
+                        LOGE("Can't read pid in lock file, deleting it! Len = %d. %s",
+                             pid_len, (pid_len < 0) ? strerror(errno) : "");
+                        if (unlink(LOCK_FILE) < 0) {
+                            LOGE("Can't delete existing lock file: %s",
+                                 strerror(errno));
+                        }
+                        sleep_time = 0;
+                    }
+                }
+            }
         }
-        sz = read(fd, &buf, sizeof(buf));
+        if (sleep_time) {
+            LOGV("Sleeping.");
+            usleep(sleep_time);
+        }
+        i--;
+    }
+
+    if (i > 0) {
+        snprintf(pid_buf, sizeof(pid_buf), "%10d\n", getpid());
+        LOGV("Writing pid_buf: %s", (char *)pid_buf);
+        if (write(fd, pid_buf, sizeof(pid_buf)-1) < 0) {
+            LOGE("Can't write to lock file: %s", strerror(errno));
+            close(fd);
+            fd = -1;
+        } else {
+            LOGV("Lock obtained");
+        }
+    } else {
+        LOGE("Can't obtain lock: %s", strerror(errno));
+    }
+
+    return fd;
+}
+
+static void unlock(int fd)
+{
+    if (fd >= 0) {
         close(fd);
-        if (sz >= 4 && memcmp(buf, "wlan", 4) == 0) {
-            rfkill_id = id;
-            break;
+        if (unlink(LOCK_FILE) < 0) {
+            LOGE("Unlock unlink error: %s", strerror(errno));
         }
+        else LOGI("Lock released");
     }
-
-    asprintf(&rfkill_state_path, "/sys/class/rfkill/rfkill%d/state", rfkill_id);
-    return 0;
 }
-
-static int check_wifi_power() {
-    int sz;
-    int fd = -1;
-    int ret = -1;
-    char buffer;
-
-    if (rfkill_id == -1) {
-        if (init_rfkill()) goto out;
-    }
-
-    fd = open(rfkill_state_path, O_RDONLY);
-    if (fd < 0) {
-        LOGE("open(%s) failed: %s (%d)", rfkill_state_path, strerror(errno),
-                errno);
-        goto out;
-    }
-    sz = read(fd, &buffer, 1);
-    if (sz != 1) {
-        LOGE("read(%s) failed: %s (%d)", rfkill_state_path, strerror(errno),
-                errno);
-        goto out;
-    }
-
-    switch (buffer) {
-        case '1':
-            ret = 1;
-            break;
-        case '0':
-            ret = 0;
-            break;
-    }
-
-out:
-    if (fd >= 0) close(fd);
-    return ret;
-}
-
-static int set_wifi_power(int on) {
-    int sz;
-    int fd = -1;
-    int ret = -1;
-    const char buffer = (on ? '1' : '0');
-
-    if (rfkill_id == -1) {
-        if (init_rfkill()) goto out;
-    }
-
-    if (check_wifi_power() == on) {
-        /* Don't change to the same state */
-        return 0;
-    }
-
-    fd = open(rfkill_state_path, O_WRONLY);
-    if (fd < 0) {
-        LOGE("open(%s) for write failed: %s (%d)", rfkill_state_path,
-                strerror(errno), errno);
-        goto out;
-    }
-    sz = write(fd, &buffer, 1);
-    if (sz < 0) {
-        LOGE("write(%s) failed: %s (%d)", rfkill_state_path, strerror(errno),
-                errno);
-        goto out;
-    }
-    if (!on) {
-        /* Give it a few seconds to fully shutdown */ 
-        sleep(3); 
-    }
-    ret = 0;
-
-out:
-    if (fd >= 0) close(fd);
-    return ret;
-}
-
-/* end rfkill support */
 
 static int insmod(const char *filename, const char *args)
 {
@@ -225,16 +244,16 @@ static int insmod(const char *filename, const char *args)
     unsigned int size;
     int ret;
 
-    /* Use rfkill if "module" is 'rfkill' */
-    if (!strncmp(DRIVER_MODULE_PATH, "rfkill", 6)) {
-        return set_wifi_power(1);
-    }
-
     module = load_file(filename, &size);
     if (!module)
         return -1;
 
     ret = init_module(module, size, args);
+
+    if ((ret < 0) && (errno == EEXIST)) {
+        LOGV("init_module: %s is already loaded", filename);
+        ret = 0;
+    }
 
     free(module);
 
@@ -246,15 +265,16 @@ static int rmmod(const char *modname)
     int ret = -1;
     int maxtry = 10;
 
-    /* Use rfkill if "module" is 'rfkill' */
-    if (!strncmp(DRIVER_MODULE_PATH, "rfkill", 6)) {
-        return set_wifi_power(0);
-    }
-
     while (maxtry-- > 0) {
-        ret = delete_module(modname, O_NONBLOCK | O_EXCL | O_TRUNC);
-        if (ret < 0 && errno == EAGAIN)
+        ret = delete_module(modname, O_NONBLOCK | O_EXCL);
+        if ((ret < 0) && (errno == EAGAIN || errno == EBUSY)) {
             usleep(500000);
+        }
+        else if ((ret < 0) && (errno == ENOENT)) {
+            LOGV("delete_module: %s is already unloaded", modname);
+            ret = 0;
+            break;
+        }
         else
             break;
     }
@@ -291,7 +311,6 @@ static int check_hotspot_driver_loaded() {
     char driver_status[PROPERTY_VALUE_MAX];
     FILE *proc;
     char line[sizeof(AP_DRIVER_MODULE_TAG)+10];
-
     if (!property_get(AP_DRIVER_PROP_NAME, driver_status, NULL)
             || strcmp(driver_status, "ok") != 0) {
         return 0;  /* driver not loaded */
@@ -317,25 +336,20 @@ static int check_hotspot_driver_loaded() {
     property_set(AP_DRIVER_PROP_NAME, "unloaded");
     return 0;
 }
-
 int hotspot_load_driver()
 {
     char driver_status[PROPERTY_VALUE_MAX];
     int count = 100; /* wait at most 20 seconds for completion */
-
     if (check_hotspot_driver_loaded()) {
         return 0;
     }
-
 #ifdef WIFI_EXT_MODULE_PATH
     if (insmod(EXT_MODULE_PATH, EXT_MODULE_ARG) < 0)
         return -1;
     usleep(200000);
 #endif
-
     if (insmod(AP_DRIVER_MODULE_PATH, AP_DRIVER_MODULE_ARG) < 0)
         return -1;
-
     if (strcmp(AP_FIRMWARE_LOADER,"") == 0) {
         usleep(WIFI_DRIVER_LOADER_DELAY);
         property_set(AP_DRIVER_PROP_NAME, "ok");
@@ -360,11 +374,9 @@ int hotspot_load_driver()
     hotspot_unload_driver();
     return -1;
 }
-
 int hotspot_unload_driver()
 {
     int count = 20; /* wait at most 10 seconds for completion */
-
     if (rmmod(AP_DRIVER_MODULE_NAME) == 0) {
         while (count-- > 0) {
             if (!check_hotspot_driver_loaded())
@@ -383,14 +395,7 @@ int hotspot_unload_driver()
     } else
         return -1;
 }
-
 static int check_driver_loaded() {
-
-    /* Use rfkill if "module" is 'rfkill' */
-    if (!strncmp(DRIVER_MODULE_PATH, "rfkill", 6)) {
-        return check_wifi_power();
-    }
-
     char driver_status[PROPERTY_VALUE_MAX];
     FILE *proc;
     char line[sizeof(DRIVER_MODULE_TAG)+10];
@@ -426,27 +431,31 @@ int wifi_load_driver()
     char driver_status[PROPERTY_VALUE_MAX];
     int count = 100; /* wait at most 20 seconds for completion */
     int status = -1;
+    int lock_id;
+
+    if ((lock_id = lock()) < 0)
+        return -1;
 
     if (check_driver_loaded()) {
+        unlock(lock_id);
         return 0;
     }
 
     property_set(DRIVER_PROP_NAME, "loading");
 
-#ifdef WIFI_EXT_MODULE_PATH
-    if (insmod(EXT_MODULE_PATH, EXT_MODULE_ARG) < 0)
-        return -1;
-    usleep(200000);
-#endif
-
     if(system(SDIO_POLLING_ON))
         LOGW("Couldn't turn on SDIO polling: %s", SDIO_POLLING_ON);
 
-    if (insmod(DRIVER_SDIO_IF_MODULE_PATH, DRIVER_SDIO_IF_MODULE_ARG) < 0)
-        goto end;
+    if ('\0' != *DRIVER_SDIO_IF_MODULE_PATH) {
+       if (insmod(DRIVER_SDIO_IF_MODULE_PATH, DRIVER_SDIO_IF_MODULE_ARG) < 0) {
+           goto end;
+       }
+    }
 
     if (insmod(DRIVER_MODULE_PATH, DRIVER_MODULE_ARG) < 0) {
-        rmmod(DRIVER_SDIO_IF_MODULE_NAME);
+        if ('\0' != *DRIVER_SDIO_IF_MODULE_NAME) {
+           rmmod(DRIVER_SDIO_IF_MODULE_NAME);
+        }
         goto end;
     }
 
@@ -465,21 +474,46 @@ int wifi_load_driver()
                 goto end;
             }
             else if (strcmp(driver_status, "failed") == 0) {
-                wifi_unload_driver();
+                _wifi_unload_driver();
                 goto end;
             }
         }
         usleep(200000);
     }
     property_set(DRIVER_PROP_NAME, "timeout");
-    wifi_unload_driver();
+    _wifi_unload_driver();
 
 end:
     system(SDIO_POLLING_OFF);
+    unlock(lock_id);
     return status;
 }
 
 int wifi_unload_driver()
+{
+    char bt_status[PROPERTY_VALUE_MAX];
+    int lock_id;
+    int status;
+
+    if (property_get("ro.config.bt.amp", bt_status, NULL)
+            && (strcmp(bt_status, "yes") == 0)) {
+
+        if (property_get("init.svc.bluetoothd", bt_status, NULL)
+                && (strcmp(bt_status, "running") == 0)) {
+            LOGV("Bluetooth is on; keep WiFi driver loaded for AMP PAL");
+            return(0);
+        }
+    }
+
+    /* Ignores possible lock failure, try to unload anyway */
+    lock_id = lock();
+    status = _wifi_unload_driver();
+    unlock(lock_id);
+
+    return status;
+}
+
+static int _wifi_unload_driver()
 {
     int count = 20; /* wait at most 10 seconds for completion */
     char driver_status[PROPERTY_VALUE_MAX];
@@ -519,16 +553,14 @@ int wifi_unload_driver()
             usleep(500000);
         }
         if (count) {
-#ifdef WIFI_EXT_MODULE_NAME
-            if (rmmod(EXT_MODULE_NAME) == 0)
-                return 0;
-#else
             if (rmmod(DRIVER_SDIO_IF_MODULE_NAME) == 0) {
                 return 0;
-#endif
+            }
         }
+
         return -1;
-    } else
+    }
+    else
         return -1;
 }
 
@@ -626,13 +658,6 @@ int wifi_start_supplicant()
         serial = pi->serial;
     }
 #endif
-    /* The ar6k driver needs the interface up in order to scan! */
-    if (!strncmp(DRIVER_MODULE_NAME, "ar6000", 6)) {
-        ifc_init();
-        ifc_up("wlan0");
-        sleep(1);
-    }
-
     property_set("ctl.start", SUPPLICANT_NAME);
     sched_yield();
 
@@ -755,7 +780,7 @@ int wifi_wait_for_event(char *buf, size_t buflen)
     int result;
     struct timeval tval;
     struct timeval *tptr;
-
+    
     if (monitor_conn == NULL) {
         LOGD("Connection closed\n");
         strncpy(buf, WPA_EVENT_TERMINATING " - connection closed", buflen-1);
@@ -783,7 +808,7 @@ int wifi_wait_for_event(char *buf, size_t buflen)
     /*
      * Events strings are in the format
      *
-     *     <N>CTRL-EVENT-XXX
+     *     <N>CTRL-EVENT-XXX 
      *
      * where N is the message level in numerical form (0=VERBOSE, 1=DEBUG,
      * etc.) and XXX is the event name. The level information is not useful
