@@ -73,6 +73,9 @@ static char iface[PROPERTY_VALUE_MAX];
 #ifndef WIFI_FIRMWARE_LOADER
 #define WIFI_FIRMWARE_LOADER		""
 #endif
+#ifndef WIFI_PRE_LOADER
+#define WIFI_PRE_LOADER		""
+#endif
 #define WIFI_TEST_INTERFACE		"sta"
 
 #define WIFI_DRIVER_LOADER_DELAY	1000000
@@ -95,6 +98,7 @@ static const char MODULE_FILE[]         = "/proc/modules";
 static const char SDIO_POLLING_ON[]     = "/etc/init.qcom.sdio.sh 1";
 static const char SDIO_POLLING_OFF[]    = "/etc/init.qcom.sdio.sh 0";
 static const char LOCK_FILE[]           = "/data/misc/wifi/drvr_ld_lck_pid";
+static const char PRELOADER[]           = WIFI_PRE_LOADER;
 
 static const char AP_DRIVER_MODULE_NAME[]  = "tiap_drv";
 static const char AP_DRIVER_MODULE_TAG[]   = "tiap_drv" " ";
@@ -345,6 +349,11 @@ int hotspot_load_driver()
         return 0;
     }
 
+    if (!strcmp(PRELOADER,"") == 0) {
+        LOGW("Starting WIFI pre-loader");
+        property_set("ctl.start", PRELOADER);
+    }
+
 #ifdef WIFI_EXT_MODULE_PATH
     if (insmod(EXT_MODULE_PATH, EXT_MODULE_ARG) < 0)
         return -1;
@@ -389,10 +398,12 @@ int hotspot_unload_driver()
         if (count) {
 #ifdef WIFI_EXT_MODULE_NAME
             if (rmmod(EXT_MODULE_NAME) == 0)
-                return 0;
-#else
-            return 0;
 #endif
+                if (!strcmp(PRELOADER,"") == 0) {
+                    LOGW("Stopping WIFI pre-loader");
+                    property_set("ctl.stop", PRELOADER);
+                }
+            return 0;
         }
         return -1;
     } else
@@ -445,6 +456,17 @@ int wifi_load_driver()
     }
 
     property_set(DRIVER_PROP_NAME, "loading");
+
+    if (!strcmp(PRELOADER,"") == 0) {
+        LOGW("Starting WIFI pre-loader");
+        property_set("ctl.start", PRELOADER);
+    }
+
+#ifdef WIFI_EXT_MODULE_PATH
+    if (insmod(EXT_MODULE_PATH, EXT_MODULE_ARG) < 0)
+        return -1;
+    usleep(200000);
+#endif
 
     if(system(SDIO_POLLING_ON))
         LOGW("Couldn't turn on SDIO polling: %s", SDIO_POLLING_ON);
@@ -556,9 +578,19 @@ static int _wifi_unload_driver()
             usleep(500000);
         }
         if (count) {
+
             if (rmmod(DRIVER_SDIO_IF_MODULE_NAME) == 0) {
                 return 0;
             }
+
+#ifdef WIFI_EXT_MODULE_NAME
+            if (rmmod(EXT_MODULE_NAME) == 0)
+#endif
+                if (!strcmp(PRELOADER,"") == 0) {
+                    LOGW("Stopping WIFI pre-loader");
+                    property_set("ctl.stop", PRELOADER);
+                }
+            return 0;
         }
 
         return -1;
