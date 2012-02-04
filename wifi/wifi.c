@@ -59,6 +59,9 @@ static char iface[PROPERTY_VALUE_MAX];
 #ifndef WIFI_FIRMWARE_LOADER
 #define WIFI_FIRMWARE_LOADER		""
 #endif
+#ifndef WIFI_PRE_LOADER
+#define WIFI_PRE_LOADER		""
+#endif
 #define WIFI_TEST_INTERFACE		"sta"
 
 #ifndef WIFI_DRIVER_FW_PATH_STA
@@ -103,8 +106,10 @@ static const char SUPP_PROP_NAME[]      = "init.svc.wpa_supplicant";
 static const char SUPP_CONFIG_TEMPLATE[]= "/system/etc/wifi/wpa_supplicant.conf";
 static const char SUPP_CONFIG_FILE[]    = "/data/misc/wifi/wpa_supplicant.conf";
 static const char P2P_CONFIG_FILE[]     = "/data/misc/wifi/p2p_supplicant.conf";
-static const char CONTROL_IFACE_PATH[]  = "/data/misc/wifi";
+static const char CONTROL_IFACE_PATH[]  = "/data/misc/wifi/sockets";
 static const char MODULE_FILE[]         = "/proc/modules";
+static const char PRELOADER[]           = WIFI_PRE_LOADER;
+static const char POSTUNLOADER[]        = WIFI_POST_UNLOADER;
 
 static const char SUPP_ENTROPY_FILE[]   = WIFI_ENTROPY_FILE;
 static unsigned char dummy_key[21] = { 0x02, 0x11, 0xbe, 0x33, 0x43, 0x35,
@@ -219,6 +224,11 @@ int wifi_load_driver()
 
     property_set(DRIVER_PROP_NAME, "loading");
 
+    if (!strcmp(PRELOADER,"") == 0) {
+        LOGW("Running WIFI pre-loader");
+        property_set("ctl.start", PRELOADER);
+    }
+
 #ifdef WIFI_EXT_MODULE_PATH
     if (insmod(EXT_MODULE_PATH, EXT_MODULE_ARG) < 0)
         return -1;
@@ -262,6 +272,8 @@ int wifi_load_driver()
 
 int wifi_unload_driver()
 {
+    int ret;
+
     usleep(200000); /* allow to finish interface down */
 #ifdef WIFI_DRIVER_MODULE_PATH
     if (rmmod(DRIVER_MODULE_NAME) == 0) {
@@ -274,9 +286,14 @@ int wifi_unload_driver()
         usleep(500000); /* allow card removal */
         if (count) {
 #ifdef WIFI_EXT_MODULE_NAME
-            if (rmmod(EXT_MODULE_NAME) == 0)
+            ret = rmmod(EXT_MODULE_NAME);
 #endif
-            return 0;
+            if (!strcmp(PRELOADER,"") == 0) {
+                LOGW("Running WIFI post-unloader");
+                property_set("ctl.start", POSTUNLOADER);
+            }
+
+            return ret;
         }
         return -1;
     } else
@@ -339,6 +356,12 @@ int update_ctrl_interface(const char *config_file) {
     char *pbuf;
     char *sptr;
     struct stat sb;
+
+    // Some setups need the ability to specify a "DIR=" style ctrl_interface,
+    // which this function would obliterate without this property check
+    if (property_get("wifi.supplicant_no_update_ctrl", ifc, NULL)
+        && strcmp(ifc, "true") == 0)
+        return 0;
 
     if (stat(config_file, &sb) != 0)
         return -1;
@@ -641,7 +664,6 @@ int wifi_connect_to_supplicant()
         ctrl_conn = monitor_conn = NULL;
         return -1;
     }
-
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, exit_sockets) == -1) {
         wpa_ctrl_close(monitor_conn);
         wpa_ctrl_close(ctrl_conn);
