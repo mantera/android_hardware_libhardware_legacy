@@ -141,8 +141,14 @@ static int rmmod(const char *modname)
 
     while (maxtry-- > 0) {
         ret = delete_module(modname, O_NONBLOCK | O_EXCL);
-        if (ret < 0 && errno == EAGAIN)
+        if ((ret < 0) && (errno == EAGAIN || errno == EBUSY)) {
             usleep(500000);
+        }
+        else if ((ret < 0) && (errno == ENOENT)) {
+            LOGV("delete_module: %s is already unloaded", modname);
+            ret = 0;
+            break;
+        }
         else
             break;
     }
