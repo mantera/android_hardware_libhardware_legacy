@@ -73,6 +73,9 @@ static char iface[PROPERTY_VALUE_MAX];
 #ifndef WIFI_FIRMWARE_LOADER
 #define WIFI_FIRMWARE_LOADER		""
 #endif
+#ifndef WIFI_PRE_LOADER
+#define WIFI_PRE_LOADER		""
+#endif
 #define WIFI_TEST_INTERFACE		"sta"
 
 #define WIFI_DRIVER_LOADER_DELAY	1000000
@@ -343,6 +346,7 @@ int hotspot_load_driver()
     if (check_hotspot_driver_loaded()) {
         return 0;
     }
+
 #ifdef WIFI_EXT_MODULE_PATH
     if (insmod(EXT_MODULE_PATH, EXT_MODULE_ARG) < 0)
         return -1;
@@ -350,6 +354,7 @@ int hotspot_load_driver()
 #endif
     if (insmod(AP_DRIVER_MODULE_PATH, AP_DRIVER_MODULE_ARG) < 0)
         return -1;
+
     if (strcmp(AP_FIRMWARE_LOADER,"") == 0) {
         usleep(WIFI_DRIVER_LOADER_DELAY);
         property_set(AP_DRIVER_PROP_NAME, "ok");
@@ -386,10 +391,12 @@ int hotspot_unload_driver()
         if (count) {
 #ifdef WIFI_EXT_MODULE_NAME
             if (rmmod(EXT_MODULE_NAME) == 0)
-                return 0;
-#else
-            return 0;
 #endif
+                if (!strcmp(PRELOADER,"") == 0) {
+                    LOGW("Stopping WIFI pre-loader");
+                    property_set("ctl.stop", PRELOADER);
+                }
+            return 0;
         }
         return -1;
     } else
