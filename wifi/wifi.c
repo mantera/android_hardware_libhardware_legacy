@@ -73,9 +73,6 @@ static char iface[PROPERTY_VALUE_MAX];
 #ifndef WIFI_FIRMWARE_LOADER
 #define WIFI_FIRMWARE_LOADER		""
 #endif
-#ifndef WIFI_PRE_LOADER
-#define WIFI_PRE_LOADER		""
-#endif
 #define WIFI_TEST_INTERFACE		"sta"
 
 #define WIFI_DRIVER_LOADER_DELAY	1000000
@@ -98,6 +95,7 @@ static const char MODULE_FILE[]         = "/proc/modules";
 static const char SDIO_POLLING_ON[]     = "/etc/init.qcom.sdio.sh 1";
 static const char SDIO_POLLING_OFF[]    = "/etc/init.qcom.sdio.sh 0";
 static const char LOCK_FILE[]           = "/data/misc/wifi/drvr_ld_lck_pid";
+
 static const char AP_DRIVER_MODULE_NAME[]  = "tiap_drv";
 static const char AP_DRIVER_MODULE_TAG[]   = "tiap_drv" " ";
 static const char AP_DRIVER_MODULE_PATH[]  = "/system/lib/modules/tiap_drv.ko";
@@ -391,12 +389,10 @@ int hotspot_unload_driver()
         if (count) {
 #ifdef WIFI_EXT_MODULE_NAME
             if (rmmod(EXT_MODULE_NAME) == 0)
-#endif
-                if (!strcmp(PRELOADER,"") == 0) {
-                    LOGW("Stopping WIFI pre-loader");
-                    property_set("ctl.stop", PRELOADER);
-                }
+                return 0;
+#else
             return 0;
+#endif
         }
         return -1;
     } else
